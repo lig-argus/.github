@@ -99,4 +99,31 @@ jobs:
             pull_request_target:assigned|issues:assigned)
               [ "$ASSIGNEE" = "$SENDER" ] && exit 0
               KIND="이슈"; [ "$EVENT_NAME" = "pull_request_target" ] && KIND="PR"
-              TEXT="📌
+              TEXT="[할당] $(mention "$ASSIGNEE") ${SENDER} 님이 ${KIND}를 할당했어요: ${LINK}"
+              ;;
+
+            # 4) 코멘트 속 @멘션 → 매핑된 사람만 Slack 멘션
+            issue_comment:created|pull_request_review_comment:created)
+              [ "$COMMENT_USER_TYPE" = "Bot" ] && exit 0
+              WHO=""
+              while read -r u; do
+                [ -z "$u" ] || [ "$u" = "$COMMENT_USER" ] && continue
+                id=$(slack_id "$u")
+                [ -n "$id" ] && WHO="$WHO <@$id>"
+              done < <(grep -oP '(?<![\w.@/])@\K[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?![\w/-])' <<<"$COMMENT_BODY" | sort -u)
+              [ -z "$WHO" ] && exit 0
+              SNIPPET=$(jq -rn --arg s "$COMMENT_BODY" '$s | gsub("\\s+";" ") | if length > 120 then .[0:120] + "..." else . end')
+              TEXT="[멘션]${WHO} ${COMMENT_USER} 님이 언급했어요: <${COMMENT_URL}|${REPO_NAME}#${NUMBER} $(esc "$TITLE")>"$'\n'"> $(esc "$SNIPPET")"
+              ;;
+
+            # 5) CI 실패 → 실행한 사람 멘션
+            workflow_run:completed)
+              [ "$WR_CONCLUSION" != "failure" ] && exit 0
+              TEXT="[CI 실패] $(mention "$WR_ACTOR") CI가 실패했어요: <${WR_URL}|${REPO_NAME} - $(esc "$WR_NAME") (${WR_BRANCH})>"
+              ;;
+          esac
+
+          [ -z "$TEXT" ] && { echo "알릴 내용 없음"; exit 0; }
+
+          jq -n --arg text "$TEXT" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
