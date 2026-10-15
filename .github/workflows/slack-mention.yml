@@ -1,13 +1,14 @@
 # 위치: lig-argus/.github 저장소의 .github/workflows/slack-mention.yml
-# "누가 지금 뭘 해야 하는지"만 담당 → 항상 사람을 멘션하는 알림만 보냄
-# (일반 소식 피드는 /github subscribe 가 담당)
+# 할 일 알림을 당사자에게 Slack DM 으로 보냄 (GitHub Mention Bot 앱의 메시지 탭)
+# - DM 실패 / 매핑 없는 사람 / 팀 리뷰 요청은 #github-bot 채널(Webhook)로 대신 보냄
+# - 이모지는 Slack 단축코드(:eyes: 등)로만 사용 (복사·붙여넣기 시 깨짐 방지)
 name: Slack mentions (reusable)
 
 on:
   workflow_call:
     inputs:
       user_map:
-        description: 'GitHub 아이디 → Slack 멤버 ID JSON'
+        description: 'GitHub 아이디 -> Slack 멤버 ID JSON'
         type: string
         required: false
         default: '{}'
@@ -16,8 +17,9 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Send Slack message
+      - name: Send Slack DM
         env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           USER_MAP: ${{ inputs.user_map }}
           EVENT_NAME: ${{ github.event_name }}
@@ -33,6 +35,7 @@ jobs:
           TEAM: ${{ github.event.requested_team.slug }}
           REVIEW_USER: ${{ github.event.review.user.login }}
           REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
           # 이슈 / 담당자
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
@@ -50,80 +53,119 @@ jobs:
           WR_ACTOR: ${{ github.event.workflow_run.actor.login }}
           WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "::error::SLACK_WEBHOOK_URL 시크릿이 없습니다 (조직 시크릿의 저장소 접근 권한 확인)"
-            exit 1
-          fi
-
           MAP="${USER_MAP:-}"
           [ -z "$MAP" ] && MAP='{}'
+          if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$MAP"; then
+            echo "::warning::SLACK_USER_MAP 이 올바른 JSON 이 아닙니다. 모두 채널로 보냅니다."
+            MAP='{}'
+          fi
           REPO_NAME="${REPO##*/}"
 
           slack_id() { jq -r --arg k "$1" '.[$k] // empty' <<<"$MAP"; }
-          mention() {
-            local id; id=$(slack_id "$1")
-            if [ -n "$id" ]; then echo "<@$id>"; else echo "@$1"; fi
-          }
-          team_mention() {
-            local id; id=$(slack_id "team:$1")
-            if [ -n "$id" ]; then echo "<!subteam^$id>"; else echo "@$1 팀"; fi
-          }
           esc() { jq -rn --arg s "$1" '$s | gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;")'; }
+
+          # 채널(Webhook)로 보내기 - 대비책
+          post_channel() {
+            if [ -z "$SLACK_WEBHOOK_URL" ]; then
+              echo "::warning::SLACK_WEBHOOK_URL 이 없어 채널로 보낼 수 없습니다"
+              return 0
+            fi
+            jq -n --arg t "$1" '{text: $t}' \
+              | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+            echo " <- channel"
+          }
+
+          # 봇 토큰으로 DM 보내기 (실패하면 1 반환)
+          post_dm() {
+            [ -z "$SLACK_BOT_TOKEN" ] && return 1
+            local resp
+            resp=$(jq -n --arg c "$1" --arg t "$2" \
+                     '{channel: $c, text: $t, unfurl_links: false, unfurl_media: false}' \
+                   | curl -sS -X POST https://slack.com/api/chat.postMessage \
+                       -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                       -H 'Content-Type: application/json; charset=utf-8' \
+                       --data @-) || return 1
+            if jq -e '.ok == true' >/dev/null <<<"$resp"; then
+              echo "DM sent -> $1"
+            else
+              echo "::warning::DM 실패($1): $(jq -r '.error // "unknown"' <<<"$resp")"
+              return 1
+            fi
+          }
+
+          # GitHub 아이디 한 명에게 보내기: DM 우선, 안 되면 채널에 멘션
+          send_to() {
+            local login="$1" msg="$2" id
+            id=$(slack_id "$login")
+            if [ -n "$id" ] && post_dm "$id" "$msg"; then return 0; fi
+            if [ -n "$id" ]; then post_channel "<@$id> $msg"; else post_channel "@$login $msg"; fi
+          }
 
           TITLE="${PR_TITLE:-$ISSUE_TITLE}"
           NUMBER="${PR_NUMBER:-$ISSUE_NUMBER}"
           URL="${PR_URL:-$ISSUE_URL}"
           LINK="<${URL}|${REPO_NAME}#${NUMBER} $(esc "$TITLE")>"
-          TEXT=""
+          NL=$'\n'
+          RECIPIENTS=()
+          MSG=""
 
           case "$EVENT_NAME:$ACTION" in
 
-            # 1) 리뷰어 지정 → 리뷰어 멘션
+            # 1) 리뷰 요청 -> 리뷰어 (요청한 사람을 함께 표시해서 재요청도 구분 가능)
             pull_request_target:review_requested)
-              if [ -n "$REVIEWER" ]; then WHO=$(mention "$REVIEWER"); else WHO=$(team_mention "$TEAM"); fi
-              TEXT="👀 ${WHO} 리뷰 요청이 왔어요: ${LINK} (작성자: ${PR_AUTHOR})"
+              if [ -z "$REVIEWER" ]; then
+                post_channel ":eyes: *팀 리뷰 요청* @${TEAM} 팀 - ${SENDER} 님이 리뷰를 요청했어요${NL}${LINK} (작성자: ${PR_AUTHOR})"
+                exit 0
+              fi
+              [ "$REVIEWER" = "$SENDER" ] && exit 0
+              RECIPIENTS=("$REVIEWER")
+              MSG=":eyes: *리뷰 요청* - ${SENDER} 님이 리뷰를 요청했어요${NL}${LINK} (작성자: ${PR_AUTHOR})"
               ;;
 
-            # 2) 리뷰 제출 → PR 작성자 멘션
+            # 2) 리뷰 제출 -> PR 작성자
             pull_request_review:submitted)
               [ "$REVIEW_USER" = "$PR_AUTHOR" ] && exit 0
               case "$REVIEW_STATE" in
-                approved)          STATE="✅ 승인했어요" ;;
-                changes_requested) STATE="🛠️ 변경을 요청했어요" ;;
-                *)                 STATE="💬 리뷰 코멘트를 남겼어요" ;;
+                approved)          STATE=":white_check_mark: *승인* - ${REVIEW_USER} 님이 내 PR을 승인했어요" ;;
+                changes_requested) STATE=":hammer_and_wrench: *변경 요청* - ${REVIEW_USER} 님이 변경을 요청했어요" ;;
+                *)                 STATE=":speech_balloon: *리뷰 코멘트* - ${REVIEW_USER} 님이 리뷰 코멘트를 남겼어요" ;;
               esac
-              TEXT="$(mention "$PR_AUTHOR") ${REVIEW_USER} 님이 ${STATE}: ${LINK}"
+              RECIPIENTS=("$PR_AUTHOR")
+              MSG="${STATE}${NL}<${REVIEW_URL:-$URL}|${REPO_NAME}#${NUMBER} $(esc "$TITLE")>"
               ;;
 
-            # 3) 이슈·PR 담당자 지정 → 담당자 멘션 (스스로 지정한 경우 제외)
+            # 3) 이슈·PR 담당자 지정 -> 담당자 (스스로 지정한 경우 제외)
             pull_request_target:assigned|issues:assigned)
               [ "$ASSIGNEE" = "$SENDER" ] && exit 0
               KIND="이슈"; [ "$EVENT_NAME" = "pull_request_target" ] && KIND="PR"
-              TEXT="[할당] $(mention "$ASSIGNEE") ${SENDER} 님이 ${KIND}를 할당했어요: ${LINK}"
+              RECIPIENTS=("$ASSIGNEE")
+              MSG=":pushpin: *할당* - ${SENDER} 님이 ${KIND}를 나에게 할당했어요${NL}${LINK}"
               ;;
 
-            # 4) 코멘트 속 @멘션 → 매핑된 사람만 Slack 멘션
+            # 4) 코멘트 속 @멘션 -> 매핑된 사람만 (코드 속 @Override 같은 오탐 방지)
             issue_comment:created|pull_request_review_comment:created)
               [ "$COMMENT_USER_TYPE" = "Bot" ] && exit 0
-              WHO=""
               while read -r u; do
-                [ -z "$u" ] || [ "$u" = "$COMMENT_USER" ] && continue
-                id=$(slack_id "$u")
-                [ -n "$id" ] && WHO="$WHO <@$id>"
+                if [ -z "$u" ] || [ "$u" = "$COMMENT_USER" ]; then continue; fi
+                if [ -n "$(slack_id "$u")" ]; then RECIPIENTS+=("$u"); fi
               done < <(grep -oP '(?<![\w.@/])@\K[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?![\w/-])' <<<"$COMMENT_BODY" | sort -u)
-              [ -z "$WHO" ] && exit 0
-              SNIPPET=$(jq -rn --arg s "$COMMENT_BODY" '$s | gsub("\\s+";" ") | if length > 120 then .[0:120] + "..." else . end')
-              TEXT="[멘션]${WHO} ${COMMENT_USER} 님이 언급했어요: <${COMMENT_URL}|${REPO_NAME}#${NUMBER} $(esc "$TITLE")>"$'\n'"> $(esc "$SNIPPET")"
+              SNIPPET=$(jq -rn --arg s "$COMMENT_BODY" '$s | gsub("\\s+";" ") | if length > 150 then .[0:150] + "..." else . end')
+              MSG=":speech_balloon: *멘션* - ${COMMENT_USER} 님이 나를 언급했어요${NL}<${COMMENT_URL}|${REPO_NAME}#${NUMBER} $(esc "$TITLE")>${NL}> $(esc "$SNIPPET")"
               ;;
 
-            # 5) CI 실패 → 실행한 사람 멘션
+            # 5) CI 실패 -> 실행한 사람
             workflow_run:completed)
               [ "$WR_CONCLUSION" != "failure" ] && exit 0
-              TEXT="[CI 실패] $(mention "$WR_ACTOR") CI가 실패했어요: <${WR_URL}|${REPO_NAME} - $(esc "$WR_NAME") (${WR_BRANCH})>"
+              RECIPIENTS=("$WR_ACTOR")
+              MSG=":x: *CI 실패* - $(esc "$WR_NAME") 워크플로가 실패했어요 (${WR_BRANCH})${NL}<${WR_URL}|${REPO_NAME} 실행 기록 보기>"
               ;;
           esac
 
-          [ -z "$TEXT" ] && { echo "알릴 내용 없음"; exit 0; }
+          if [ ${#RECIPIENTS[@]} -eq 0 ]; then
+            echo "알릴 대상 없음 (event: $EVENT_NAME:$ACTION)"
+            exit 0
+          fi
 
-          jq -n --arg text "$TEXT" '{text: $text}' \
-            | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+          for r in "${RECIPIENTS[@]}"; do
+            send_to "$r" "$MSG"
+          done
